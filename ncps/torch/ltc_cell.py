@@ -28,6 +28,7 @@ class LTCCell(nn.Module):
         ode_unfolds=6,
         epsilon=1e-8,
         implicit_param_constraints=False,
+        model_name="ltc"
     ):
         """A `Liquid time-constant (LTC) <https://ojs.aaai.org/index.php/AAAI/article/view/16936>`_ cell.
 
@@ -72,6 +73,7 @@ class LTCCell(nn.Module):
         self._epsilon = epsilon
         self._clip = torch.nn.ReLU()
         self._allocate_parameters()
+        self.ode_step = self._ode_step_runge_kutta if model_name == "ltc_rk" else self._ode_solver
 
     @property
     def state_size(self):
@@ -248,6 +250,42 @@ class LTCCell(nn.Module):
 
         return v_pre
 
+    
+    ################################# Here is the new code for runge kutta #################################
+    def _ode_step_runge_kutta(self, inputs, state, elapsed_time):
+        h = 0.1
+        cm_t = self.make_positive_fn(self._params["cm"]) / (elapsed_time / self._ode_unfolds)
+        for i in range(self._ode_unfolds):
+            k1 = h * self._f_prime(inputs, state, cm_t)
+            k2 = h * self._f_prime(inputs, state + k1 * 0.5, cm_t)
+            k3 = h * self._f_prime(inputs, state + k2 * 0.5, cm_t)
+            k4 = h * self._f_prime(inputs, state + k3, cm_t)
+
+            state = state + 1.0 / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+        return state
+    
+    def _f_prime(self, inputs, state, cm_t):
+        v_pre = state
+
+        sensory_w_activation = self._params["sensory_w"] * self._sigmoid(inputs, self._params["sensory_mu"], self._params["sensory_sigma"])
+        w_reduced_sensory = torch.sum(sensory_w_activation, dim=1)
+
+        w_activation = self._params["w"] * self._sigmoid(v_pre, self._params["mu"], self._params["sigma"])
+        w_reduced_synapse = torch.sum(w_activation, dim=1)
+
+        sensory_in = self._params["sensory_erev"] * sensory_w_activation
+        synapse_in = self._params["erev"] * w_activation
+
+        sum_in = torch.sum(sensory_in, dim=1) - v_pre * w_reduced_synapse + torch.sum(synapse_in, dim=1) - v_pre * w_reduced_sensory
+
+        f_prime = 1 / cm_t * (self._params["gleak"] * (self._params["vleak"] - v_pre) + sum_in)
+
+        return f_prime
+
+    ################################# Here is the end of code for runge kutta #################################
+    
+    
     def _map_inputs(self, inputs):
         if self._input_mapping in ["affine", "linear"]:
             inputs = inputs * self._params["input_w"]
@@ -279,8 +317,8 @@ class LTCCell(nn.Module):
         # Regularly sampled mode (elapsed time = 1 second)
         inputs = self._map_inputs(inputs)
 
-        next_state = self._ode_solver(inputs, states, elapsed_time)
+        next_state = self.ode_step(inputs, states, elapsed_time)
 
         outputs = self._map_outputs(next_state)
 
-        return outputs, next_state
+        return outputs, next_state        
